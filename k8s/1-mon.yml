@@ -1,0 +1,190 @@
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: mon
+  namespace: ceph
+spec:
+  selector:
+    app: mon
+  clusterIP: None
+  # https://docs.ceph.com/docs/master/dev/mon-bootstrap/
+  publishNotReadyAddresses: true  # needs for initial discovery, while they are not yet running
+  ports:
+  - name: v2
+    port: 3300
+    protocol: TCP
+    targetPort: 3300
+  - name: v1
+    port: 6789
+    protocol: TCP
+    targetPort: 6789
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: mon
+  name: mon
+  namespace: ceph
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mon
+  serviceName: mon
+  template:
+    metadata:
+      labels:
+        app: mon
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/master: ''
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - mon
+            topologyKey: kubernetes.io/hostname
+      automountServiceAccountToken: false
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      initContainers:
+        - name: cp
+          image: bhgedigital/envsubst
+          command:
+          - sh
+          - -c
+          - |
+            cat /run/secrets/conf/ceph.conf | envsubst > /etc/ceph/ceph.conf
+            cp /run/secrets/etc/* /etc/ceph/
+            chown -R 167:167 /var/lib/ceph/mon/
+          env:
+          - name: FSID
+            valueFrom:
+              configMapKeyRef:
+                name: fsid
+                key: fsid
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+          - name: ceph-var-mon
+            mountPath: /var/lib/ceph/mon/
+          - name: shared-etc
+            mountPath: /etc/ceph/
+          - name: ceph-etc
+            mountPath: /run/secrets/etc
+          - name: ceph-conf
+            mountPath: /run/secrets/conf
+        - name: init
+          image: ceph/ceph:v14.2.4-20190917
+          command:
+          - sh
+          - -c
+          - |
+            base="/var/lib/ceph/mon/ceph-$HOSTNAME"
+            if [ ! -e "$base/keyring" ]; then
+              echo "Bootstrapping new mon from secrets"
+              ceph-mon --setuser ceph --setgroup ceph --cluster ceph --mkfs -i $HOSTNAME --keyring /etc/ceph/ceph.mon.keyring --mon-data $base --fsid $FSID --public-addr $POD_IP
+            fi
+          env:
+          - name: FSID
+            valueFrom:
+              configMapKeyRef:
+                name: fsid
+                key: fsid
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+          - name: ceph-var-mon
+            mountPath: /var/lib/ceph/mon/
+          - name: shared-etc
+            mountPath: /etc/ceph/
+      containers:
+      - name: mon
+        image: ceph/ceph:v14.2.4-20190917
+        command:
+        - sh
+        - -c
+        - exec ceph-mon -i $HOSTNAME -d --public-addr v2:$POD_IP:3300,v1:$POD_IP:6789
+        env:
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+        imagePullPolicy: IfNotPresent
+        # securityContext:
+        #   privileged: true
+        #   procMount: Default
+        #   runAsUser: 167  # TODO: unable to write to '/dev/stderr' for channel 'cluster': (13) Permission denied
+        readinessProbe:
+          tcpSocket:
+            port: 3300
+          timeoutSeconds: 5
+        resources:
+          limits:
+            memory: 1Gi
+          requests:
+            cpu: 100m
+            memory: 1Gi
+        volumeMounts:
+        - mountPath: /dev  # e3 failed to get devid for : udev_device_new_from_subsystem_sysname failed on
+          name: dev
+        - name: shared-etc
+          mountPath: /etc/ceph/
+        - name: ceph-var-mon
+          mountPath: /var/lib/ceph/mon
+        - name: ceph-bootstrap-osd-keyring
+          mountPath: /var/lib/ceph/bootstrap-osd
+        - name: ceph-bootstrap-mds-keyring
+          mountPath: /var/lib/ceph/bootstrap-mds
+        - name: ceph-bootstrap-rgw-keyring
+          mountPath: /var/lib/ceph/bootstrap-rgw
+        - name: ceph-bootstrap-rbd-keyring
+          mountPath: /var/lib/ceph/bootstrap-rbd
+      dnsConfig:
+        options:
+        - name: ndots
+          value: '2'
+      enableServiceLinks: false
+      priorityClassName: high
+      volumes:
+      - name: ceph-conf
+        configMap:
+          name: ceph
+      - name: ceph-etc
+        secret:
+          secretName: ceph-etc
+      - name: ceph-bootstrap-osd-keyring
+        secret:
+          secretName: ceph-bootstrap-osd-keyring
+      - name: ceph-bootstrap-mds-keyring
+        secret:
+          secretName: ceph-bootstrap-mds-keyring
+      - name: ceph-bootstrap-rgw-keyring
+        secret:
+          secretName: ceph-bootstrap-rgw-keyring
+      - name: ceph-bootstrap-rbd-keyring
+        secret:
+          secretName: ceph-bootstrap-rbd-keyring
+      - name: shared-etc
+        emptyDir: {}
+      - name: ceph-var-mon
+        hostPath:
+          path: /var/lib/ceph/mon
+      - hostPath:
+          path: /dev
+          type: ""
+        name: dev

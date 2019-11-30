@@ -1,0 +1,46 @@
+# https://github.com/ceph/ceph-container/tree/master/examples/kubernetes
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ceph
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ceph
+  namespace: ceph
+data:
+  ceph.conf: |
+    [global]
+    fsid                      = $FSID
+    mon host                  = any.mon.ceph.svc.cluster.local
+    log file                  = /dev/stderr
+    mon cluster log file      = /dev/stderr
+    mon cluster log file level = info
+
+    [mon]
+    ms_bind_msgr1             = true
+    debug mon                 = 1/5
+    debug monc                = 1/5
+    mon data avail warn       = 10
+    # https://docs.ceph.com/docs/nautilus/mgr/dashboard/
+    mgr initial modules       = dashboard prometheus pg_autoscaler
+
+    [mgr]
+    # https://docs.ceph.com/docs/nautilus/rados/troubleshooting/log-and-debug/
+    debug mgr                 = 1/5
+    debug mgrc                = 1/5
+
+    # https://docs.ceph.com/docs/master/rados/configuration/osd-config-ref/
+    [osd]
+    crush location            = root=default host=$NODE_NAME
+    osd_memory_target         = 4294967296  # https://docs.ceph.com/docs/master/rados/configuration/bluestore-config-ref/
+    osd scrub begin hour      = 20
+    osd scrub end hour        = 8
+    osd scrub sleep           = 0.1
+
+    [mds]
+    mds_standby_for_fscid     = 1
+    mds_standby_replay        = true
+    mds cache memory limit    = 1073741824  # 1Gi

@@ -1,0 +1,148 @@
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: mgr
+  namespace: ceph
+spec:
+  selector:
+    app: mgr
+  ports:
+  - name: dashboard
+    port: 8080
+    protocol: TCP
+    targetPort: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet  # to have single name for pod
+metadata:
+  labels:
+    app: mgr
+  name: mgr
+  namespace: ceph
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mgr
+  serviceName: mgr
+  template:
+    metadata:
+      labels:
+        app: mgr
+      annotations:
+        prometheus.io/port: '9283'
+        prometheus.io/scrape: 'true'
+        co.elastic.logs/exclude_lines: '\[DBG\]'  # TODO: https://tracker.ceph.com/issues/39646
+    spec:
+      automountServiceAccountToken: false
+      initContainers:
+        - name: cp
+          image: bhgedigital/envsubst
+          command:
+          - sh
+          - -c
+          - |
+            cat /run/secrets/conf/ceph.conf | envsubst > /etc/ceph/ceph.conf
+            cp /run/secrets/etc/* /etc/ceph/
+            chown -R 167:167 /var/lib/ceph
+          env:
+          - name: FSID
+            valueFrom:
+              configMapKeyRef:
+                name: fsid
+                key: fsid
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+          - name: ceph-var
+            mountPath: /var/lib/ceph
+          - name: shared-etc
+            mountPath: /etc/ceph/
+          - name: ceph-etc
+            mountPath: /run/secrets/etc
+          - name: ceph-conf
+            mountPath: /run/secrets/conf
+        - name: init
+          image: ceph/ceph:v14.2.4-20190917
+          command:
+          - sh
+          - -c
+          - |
+            keyring="/var/lib/ceph/mgr/ceph-$POD_NAME/keyring"
+            if [ ! -e "$keyring" ]; then
+              echo "Bootstrapping new mgr from secrets"
+              mkdir -p /var/lib/ceph/mgr/ceph-$POD_NAME
+              ceph auth get-or-create mgr.$POD_NAME mon 'allow profile mgr' osd 'allow *' mds 'allow *' -o $keyring
+            fi
+          env:
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+          - name: ceph-var
+            mountPath: /var/lib/ceph
+          - name: shared-etc
+            mountPath: /etc/ceph/
+      containers:
+      - name: mgr
+        image: ceph/ceph:v14.2.4-20190917
+        command:
+        - sh
+        - -c
+        - exec ceph-mgr -i $POD_NAME -d --public-addr $POD_IP
+        env:
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          runAsUser: 167
+        readinessProbe:
+          tcpSocket:
+            port: 8080
+          timeoutSeconds: 5
+        livenessProbe:
+          tcpSocket:
+            port: 6800
+          timeoutSeconds: 5
+        resources:
+          limits:
+            memory: 400Mi
+          requests:
+            cpu: 100m
+            memory: 400Mi
+        volumeMounts:
+        - name: shared-etc
+          mountPath: /etc/ceph/
+        - name: ceph-var
+          mountPath: /var/lib/ceph
+      dnsConfig:
+        options:
+        - name: ndots
+          value: '2'
+      enableServiceLinks: false
+      priorityClassName: high
+      volumes:
+      - name: ceph-conf
+        configMap:
+          name: ceph
+      - name: ceph-etc
+        secret:
+          secretName: ceph-etc
+      - name: shared-etc
+        emptyDir: {}
+      - name: ceph-var
+        emptyDir: {}

@@ -1,0 +1,219 @@
+# TODO: run multiple OSD in hostnet on same host?
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    app: osd-discover
+  name: osd-discover
+spec:
+  selector:
+    matchLabels:
+      app: osd-discover
+  template:
+    metadata:
+      labels:
+        app: osd-discover
+    spec:
+      serviceAccountName: ceph-osd
+      containers:
+      - name: osd-discover
+        image: sepa/osd-discover
+        imagePullPolicy: Always
+        command:
+        - bash
+        - -c
+        - |
+          while true; do
+            date
+            for disk in `lvs -o lv_tags --noheadings 2>/dev/null`; do
+              tags=`echo "$disk" | tr ',' '\n' | sed 's/.*ceph\.//'`
+              eval $tags
+              if [ "`kubectl get deploy -l app=osd,id=$osd_id --no-headers --ignore-not-found=true`" ]; then
+                echo "Already exist osd_id: $osd_id, osd_fsid: $osd_fsid"
+              else
+                echo "Creating osd_id: $osd_id, osd_fsid: $osd_fsid"
+                cat /run/conf/osd.yml | ID=$osd_id UUID=$osd_fsid envsubst '$ID $UUID $NODE_NAME' | kubectl apply -f -
+              fi
+            done
+            sleep 300
+          done
+        securityContext:
+          runAsUser: 0
+        env:
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+        resources:
+          limits:
+            memory: 100Mi
+          requests:
+            cpu: 10m
+            memory: 15Mi
+        securityContext:
+          privileged: true
+        volumeMounts:
+          - mountPath: /dev
+            name: dev
+          - name: osd-template
+            mountPath: /run/conf/
+      dnsConfig:
+        options:
+        - name: ndots
+          value: '2'
+      enableServiceLinks: false
+      priorityClassName: high
+      volumes:
+      - name: dev
+        hostPath:
+          path: /dev
+          type: ""
+      - name: osd-template
+        configMap:
+          name: osd-template
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: osd-template
+  namespace: ceph
+data:
+  osd.yml: |
+    apiVersion: apps/v1
+    kind: Deployment  # TODO: maybe do it StatefulSet to have strategy:OnDelete
+    metadata:
+      annotations:
+      labels:
+        app: osd
+        id: '${ID}'
+      name: osd-${ID}
+      namespace: ceph
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: osd
+          id: '${ID}'
+      strategy:
+        type: Recreate
+      template:
+        metadata:
+          labels:
+            app: osd
+            id: '${ID}'
+          name: osd-${ID}
+          namespace: ceph
+        spec:
+          nodeSelector:
+            kubernetes.io/hostname: ${NODE_NAME}
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          initContainers:
+          - name: cp
+            image: bhgedigital/envsubst
+            command:
+            - sh
+            - -c
+            - cat /run/secrets/conf/ceph.conf | envsubst > /etc/ceph/ceph.conf
+            env:
+            - name: FSID
+              valueFrom:
+                configMapKeyRef:
+                  key: fsid
+                  name: fsid
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: spec.nodeName
+            imagePullPolicy: Always
+            resources: {}
+            securityContext:
+              runAsUser: 0
+            volumeMounts:
+            - mountPath: /etc/ceph/
+              name: shared-etc
+            - mountPath: /run/secrets/conf
+              name: ceph-conf
+          containers:
+          - name: osd
+            image: ceph/ceph:v14.2.4-20190917
+            command:
+            - sh
+            - -c
+            - |
+              ceph-volume lvm activate --no-systemd ${ID} ${UUID} && \
+              exec ceph-osd -i ${ID} --setuser ceph --setgroup ceph -f --public-addr $POD_IP
+            imagePullPolicy: IfNotPresent
+            env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            resources:
+              limits:
+                memory: 5G
+              requests:
+                cpu: 10m
+                memory: 5G
+            securityContext:
+              privileged: true
+            volumeMounts:
+            - mountPath: /dev
+              name: dev
+            - mountPath: /etc/ceph/
+              name: shared-etc
+          dnsConfig:
+            options:
+            - name: ndots
+              value: "2"
+          priorityClassName: high
+          restartPolicy: Always
+          terminationGracePeriodSeconds: 30
+          volumes:
+          - name: dev
+            hostPath:
+              path: /dev
+              type: ""
+          - name: ceph-conf
+            configMap:
+              name: ceph
+          - name: shared-etc
+            emptyDir: {}
+---
+# serviceaccount able to create new osd deployments
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ceph-osd
+  namespace: ceph
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ceph-osd
+  namespace: ceph
+rules:
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - get
+  - list
+  - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ceph-osd
+  namespace: ceph
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ceph-osd
+subjects:
+- kind: ServiceAccount
+  name: ceph-osd
+  namespace: ceph

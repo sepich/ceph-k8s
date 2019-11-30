@@ -1,0 +1,133 @@
+# Used only for manual work on nodes
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+  labels:
+    app: tools
+  name: tools
+  namespace: ceph
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: tools
+  template:
+    metadata:
+      labels:
+        app: tools
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - tools
+            topologyKey: kubernetes.io/hostname
+      automountServiceAccountToken: false
+      dnsConfig:
+        options:
+        - name: ndots
+          value: '2'
+      enableServiceLinks: false
+      priorityClassName: low
+      initContainers:
+        - name: cp
+          image: bhgedigital/envsubst
+          command:
+          - sh
+          - -c
+          - |
+            cat /run/secrets/conf/ceph.conf | envsubst > /etc/ceph/ceph.conf
+            cp /run/secrets/etc/* /etc/ceph/
+          env:
+          - name: FSID
+            valueFrom:
+              configMapKeyRef:
+                name: fsid
+                key: fsid
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+          - name: shared-etc
+            mountPath: /etc/ceph/
+          - name: ceph-etc
+            mountPath: /run/secrets/etc
+          - name: ceph-conf
+            mountPath: /run/secrets/conf
+      containers:
+      - name: tools
+        command:
+        - tailf
+        - /etc/issue
+        image: ceph/ceph:v14.2.4-20190917
+        securityContext:
+          privileged: true
+          procMount: Default
+        env:
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+        volumeMounts:
+        - mountPath: /dev
+          name: dev
+        - mountPath: /sys/bus
+          name: sysbus
+        - mountPath: /lib/modules
+          name: libmodules
+        - name: shared-etc
+          mountPath: /etc/ceph/
+        - name: ceph-bootstrap-osd-keyring
+          mountPath: /var/lib/ceph/bootstrap-osd
+        - name: ceph-bootstrap-mds-keyring
+          mountPath: /var/lib/ceph/bootstrap-mds
+        - name: ceph-bootstrap-rgw-keyring
+          mountPath: /var/lib/ceph/bootstrap-rgw
+        - name: ceph-bootstrap-rbd-keyring
+          mountPath: /var/lib/ceph/bootstrap-rbd
+      restartPolicy: Always
+      volumes:
+      - hostPath:
+          path: /dev
+          type: ""
+        name: dev
+      - hostPath:
+          path: /sys/bus
+          type: ""
+        name: sysbus
+      - hostPath:
+          path: /lib/modules
+          type: ""
+        name: libmodules
+      - name: ceph-conf
+        configMap:
+          name: ceph
+      - name: ceph-etc
+        secret:
+          secretName: ceph-etc
+      - name: ceph-bootstrap-osd-keyring
+        secret:
+          secretName: ceph-bootstrap-osd-keyring
+      - name: ceph-bootstrap-mds-keyring
+        secret:
+          secretName: ceph-bootstrap-mds-keyring
+      - name: ceph-bootstrap-rgw-keyring
+        secret:
+          secretName: ceph-bootstrap-rgw-keyring
+      - name: ceph-bootstrap-rbd-keyring
+        secret:
+          secretName: ceph-bootstrap-rbd-keyring
+      - name: shared-etc
+        emptyDir: {}

@@ -1,0 +1,163 @@
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: mds
+  namespace: ceph
+spec:
+  selector:
+    app: mds
+  ports:
+  - name: cephfs
+    port: 8080
+    protocol: TCP
+    targetPort: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet  # to have stable POD_NAME
+metadata:
+  labels:
+    app: mds
+  name: mds
+  namespace: ceph
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mds
+  serviceName: mds
+  template:
+    metadata:
+      labels:
+        app: mds
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - mds
+            topologyKey: kubernetes.io/hostname
+      automountServiceAccountToken: false
+      initContainers:
+        - name: cp
+          image: bhgedigital/envsubst
+          command:
+          - sh
+          - -c
+          - |
+            cat /run/secrets/conf/ceph.conf | envsubst > /etc/ceph/ceph.conf
+            cp /run/secrets/etc/* /etc/ceph/
+            chown -R 167:167 /var/lib/ceph
+          env:
+          - name: FSID
+            valueFrom:
+              configMapKeyRef:
+                name: fsid
+                key: fsid
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+          - name: ceph-var
+            mountPath: /var/lib/ceph
+          - name: shared-etc
+            mountPath: /etc/ceph/
+          - name: ceph-etc
+            mountPath: /run/secrets/etc
+          - name: ceph-conf
+            mountPath: /run/secrets/conf
+        - name: init
+          image: ceph/ceph:v14.2.4-20190917
+          command:
+          - sh
+          - -c
+          - |
+            keyring="/var/lib/ceph/mds/ceph-$POD_NAME/keyring"
+            if [ ! -e "$keyring" ]; then
+              echo "Bootstrapping new mds from secrets"
+              mkdir -p /var/lib/ceph/mds/ceph-$POD_NAME
+              ceph auth get-or-create mds.$POD_NAME mon 'profile mds' mgr 'profile mds' mds 'allow *' osd 'allow *' -o $keyring
+            fi
+            # TODO: make it work via bootstrap-mds
+            rm /etc/ceph/ceph.client.admin.keyring /etc/ceph/ceph.mon.keyring
+          env:
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+          - name: ceph-var
+            mountPath: /var/lib/ceph
+          - name: ceph-bootstrap-mds-keyring
+            mountPath: /var/lib/ceph/bootstrap-mds
+          - name: shared-etc
+            mountPath: /etc/ceph/
+      containers:
+      - name: mds
+        image: ceph/ceph:v14.2.4-20190917
+        command:
+        - sh
+        - -c
+        - exec ceph-mds -i $POD_NAME -d --public-addr $POD_IP
+        env:
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          runAsUser: 167
+        readinessProbe:
+          tcpSocket:
+            port: 6800
+          timeoutSeconds: 5
+        livenessProbe:
+          tcpSocket:
+            port: 6800
+          timeoutSeconds: 5
+        resources:
+          limits:
+            memory: 1Gi
+          requests:
+            cpu: 100m
+            memory: 1Gi
+        volumeMounts:
+        - name: shared-etc
+          mountPath: /etc/ceph/
+        - name: ceph-var
+          mountPath: /var/lib/ceph
+        - name: ceph-bootstrap-mds-keyring
+          mountPath: /var/lib/ceph/bootstrap-mds
+      dnsConfig:
+        options:
+        - name: ndots
+          value: '2'
+      enableServiceLinks: false
+      priorityClassName: high
+      volumes:
+      - name: ceph-conf
+        configMap:
+          name: ceph
+      - name: shared-etc
+        emptyDir: {}
+      - name: ceph-var
+        emptyDir: {}
+      - name: ceph-bootstrap-mds-keyring
+        secret:
+          secretName: ceph-bootstrap-mds-keyring
+      - name: ceph-etc
+        secret:
+          secretName: ceph-etc
